@@ -373,7 +373,7 @@ class VoxCPMGenerationMixin:
             dtype=torch.float32,
             device=text_token.device,
         )
-        text_token = torch.cat([text_token, text_pad_token])
+        text_token_padded = torch.cat([text_token, text_pad_token])
         audio_feat = torch.cat([audio_pad_feat, prompt_audio_feat], dim=0)
         # 掩码构造：前 text_length 个位置为文本，后 audio_length 个位置为音频
         text_mask = (
@@ -385,7 +385,7 @@ class VoxCPMGenerationMixin:
 
         # 增加 batch 维并搬到运行设备
         return (
-            text_token.unsqueeze(0).to(self.device),
+            text_token_padded.unsqueeze(0).to(self.device),
             text_mask.unsqueeze(0).to(self.device),
             audio_feat.unsqueeze(0).to(self.device).to(get_dtype(self.config.dtype)),
             audio_mask.unsqueeze(0).to(self.device),
@@ -440,7 +440,7 @@ class VoxCPMGenerationMixin:
                 流式时为（最近 chunk 特征 (1, D, t*P)，patch 列表）；
                 非流式时为（完整特征 (1, D, T*P)，patch 序列张量 (T, P, D)）。
         """
-        B, T, P, D = feat.shape  # (batch=1, 序列长度, patch 大小, 特征维度)
+        batch_size, T, P, D = feat.shape  # (batch=1, 序列长度, patch 大小, 特征维度)
 
         # prefill 用未编译的原始编码器（形状多变时比编译版更稳），生成循环内再用编译版
         prefill_encoder = getattr(self, "_feat_encoder_raw", self.feat_encoder)
@@ -509,6 +509,10 @@ class VoxCPMGenerationMixin:
                 cond=prefix_feat_cond.transpose(1, 2).contiguous(),
                 n_timesteps=inference_timesteps,
                 cfg_value=cfg_value,
+                # 蒸馏推理接线：属性存在且为 True 时走 distill_solver（每步单前向）；
+                # 默认属性不存在 -> False，对非蒸馏使用零影响
+                use_distill=getattr(self.feat_decoder, "use_distill_solver", False),
+                distill_use_dt=getattr(self.feat_decoder, "distill_use_dt", True),
             ).transpose(
                 1, 2
             )  # [b, p, d]
@@ -525,7 +529,7 @@ class VoxCPMGenerationMixin:
                 # 取最近 streaming_prefix_len 个 patch 交给 VAE 解码：
                 # VAE 解码需要前后上下文，多给几个 patch 才能保证拼接处平滑无缝
                 pred_feat_chunk = torch.cat(pred_feat_seq[-streaming_prefix_len:], dim=1)
-                feat_pred = rearrange(pred_feat_chunk, "b t p d -> b d (t p)", b=B, p=self.patch_size)
+                feat_pred = rearrange(pred_feat_chunk, "b t p d -> b d (t p)", b=batch_size, p=self.patch_size)
 
                 yield feat_pred, pred_feat_seq
 
@@ -549,5 +553,5 @@ class VoxCPMGenerationMixin:
         if not streaming:
             # 非流式：把所有 patch 沿时间维拼接成完整序列
             pred_feat_seq = torch.cat(pred_feat_seq, dim=1)  # b, t, p, d
-            feat_pred = rearrange(pred_feat_seq, "b t p d -> b d (t p)", b=B, p=self.patch_size)
+            feat_pred = rearrange(pred_feat_seq, "b t p d -> b d (t p)", b=batch_size, p=self.patch_size)
             yield feat_pred, pred_feat_seq.squeeze(0).cpu()

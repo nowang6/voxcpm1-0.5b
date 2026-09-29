@@ -101,7 +101,15 @@ def load_from_local(
     for kw, val in vae_state_dict.items():
         model_state_dict[f"audio_vae.{kw}"] = val
 
-    model.load_state_dict(model_state_dict)
+    # cfg_mlp 是 CFG 蒸馏新增模块：旧权重（预训练/非蒸馏产物）缺失其 4 个键是合法的，
+    # 零初始化补齐后行为与原模型完全一致（w 嵌入输出恒 0）；其余缺失/多余键仍视为加载错误。
+    missing, unexpected = model.load_state_dict(model_state_dict, strict=False)
+    allowed_missing = {k for k in missing if "cfg_mlp" in k}
+    bad_missing = [k for k in missing if k not in allowed_missing]
+    if bad_missing or unexpected:
+        raise RuntimeError(f"Error(s) in loading state_dict: missing={bad_missing[:5]} unexpected={list(unexpected)[:5]}")
+    if allowed_missing:
+        model.feat_decoder.estimator.init_cfg_embedding_zero()
     if training:
         return model
     # 推理模式：搬到目标设备、切 eval，并按需启用 torch.compile 优化

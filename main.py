@@ -6,9 +6,9 @@ model = VoxCPMTTS(
     optimize=False
 )
 
-text = '太阳一晒，我就变成气升到天空，我又变成无数极小极小的点儿。连成一片在空中漂浮，有时候我穿着白衣服，有时候我穿着黑衣服。早晨和傍晚，我又把红袍披在身上。人们叫我云，气温越来越低。变成了无数小水滴，小水滴聚在一起落下来。人们叫我雨，有时候我变成小硬球。'
+text = '一次列一百个单词不方便记忆哦，我可以每次给你分享一些常用的含s的单词，你慢慢积累会更高效，需要继续再给你补充更多单词哦。'
 
-PROMPT_PATH = './assets/zero_shot_prompt.wav'
+PROMPT_PATH = './assets/gentle_senior.wav'
 PROMPT_TEXT = '希望你以后能够做得比我还好呦。'
 
 start_time = time.time()
@@ -22,4 +22,6 @@ wav = model.generate(
     seed=42,
 )
 
+
+sf.write('output.wav', wav, 16000)
 print(f"生成完成，总耗时 {time.time() - start_time:.2f}s")

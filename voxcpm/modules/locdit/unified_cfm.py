@@ -71,6 +71,10 @@ class UnifiedCFM(torch.nn.Module):
         self.mean_mode = mean_mode
 
         self.estimator = estimator  # 速度场估计器（局部 DiT）
+        # 蒸馏用的可选冻结教师副本。设置后蒸馏损失用该副本计算回归目标，而非
+        # ``self.estimator``：学生（全网络可训练）更新时目标保持静止——共享权重
+        # 方案下学生每次更新都会移动自己的教师目标，训练不稳定。
+        self.teacher_estimator: VoxCPMLocDiT | None = None
 
     # ------------------------------------------------------------------ #
     # Inference
@@ -87,6 +91,8 @@ class UnifiedCFM(torch.nn.Module):
         cfg_value: float = 1.0,
         sway_sampling_coef: float = 1.0,
         use_cfg_zero_star: bool = True,
+        use_distill: bool = False,
+        distill_use_dt: bool = True,
     ):
         """CFM 推理入口：从高斯噪声出发，沿估计速度场求解 ODE 生成隐变量。
 
@@ -99,10 +105,26 @@ class UnifiedCFM(torch.nn.Module):
             cfg_value: 分类器无关引导强度
             sway_sampling_coef: 时间步摆动采样（sway sampling）系数，对时间网格做非均匀重参数化
             use_cfg_zero_star: 是否启用 CFG-Zero* 优化（前期步零初始化 + 无条件速度自适应缩放）
+            use_distill: 为 True 时走蒸馏求解器 ``distill_solver``——每步单前向、
+                CFG 已烘焙进 w 嵌入（``cfg_value`` 即训练时的 w）。要求加载
+                蒸馏后的 estimator 权重（含 ``cfg_mlp``）
+            distill_use_dt: 蒸馏求解器是否向 dt 嵌入传每步步宽。必须与训练时
+                一致：CFG 蒸馏（阶段 1）学生恒以 dt=0 训练，须传 False
 
         返回:
             ODE 轨迹的最终状态（生成的隐变量），形状 (B, C, T)
         """
+        if use_distill:
+            return self.distill_solver(
+                mu=mu,
+                n_timesteps=n_timesteps,
+                patch_size=patch_size,
+                cond=cond,
+                temperature=temperature,
+                sway_sampling_coef=sway_sampling_coef,
+                w=cfg_value,
+                use_dt_embed=distill_use_dt,
+            )
         batch_size, _ = mu.shape
 
         # 初始噪声状态 (B, C, T)
@@ -293,6 +315,130 @@ class UnifiedCFM(torch.nn.Module):
                 time_step = current_time - time_steps[step_index + 1]
 
         return trajectory[-1]
+
+    # ------------------------------------------------------------------ #
+    # Distillation training loss & solver
+    # 蒸馏训练损失与求解器
+    # ------------------------------------------------------------------ #
+    def compute_cfg_distill_loss(
+        self,
+        x1: torch.Tensor,
+        mu: torch.Tensor,
+        cond: torch.Tensor | None = None,
+        tgt_mask: torch.Tensor | None = None,
+        w: float = 2.0,
+        clamp_s_star: Tuple[float, float] = (0.0, 1.0),
+        t_sampling: str = "uniform",
+    ):
+        """CFG（引导）蒸馏损失。
+
+        冻结教师做条件/无条件双前向，按推理时完全一致的方式（含 CFG-Zero*
+        最优缩放）组合出目标速度场；学生单次前向 + w 嵌入回归该组合场。
+
+        参数:
+            x1: 目标干净隐变量，形状 (B, C, T)
+            mu: 全局条件向量，形状 (B, C)（预计算的 DiT 条件）
+            cond: 前缀条件，形状 (B, C, T')
+            tgt_mask: 有效帧掩码，形状 (B, 1, T)
+            w: 蒸馏目标使用的 CFG 引导强度（与推理时的 cfg_value 一致）
+            clamp_s_star: s_star 的截断区间
+            t_sampling: "uniform" 均匀覆盖全 t 区间；"log-norm" 匹配基模型 CFM
+                训练分布（偏向小 t）。蒸馏必须用 uniform：推理 Euler 从 t=1
+                开始积分，大 t 区无监督会导致轨迹从第一步就偏离（实测 t>=0.8
+                处场误差 ~0.3）
+
+        返回:
+            标量损失（学生 vs 教师组合场的 MSE，掩码归一化）
+        """
+        b, _, _ = x1.shape
+        if cond is None:
+            cond = torch.zeros_like(x1)  # 无前缀条件时用零张量占位
+
+        if t_sampling == "uniform":
+            t = torch.rand(b, device=x1.device, dtype=x1.dtype)
+        else:
+            t = torch.sigmoid(torch.randn(b, device=x1.device, dtype=x1.dtype))
+        z = torch.randn_like(x1)  # 标准高斯噪声 x0
+        y = (1 - t.view(-1, 1, 1)) * x1 + t.view(-1, 1, 1) * z  # 噪声插值点 x_t
+
+        # ---- 冻结教师：条件 + 无条件双前向（cond 前缀两分支均保留，仅 mu 置零，与推理一致） ----
+        teacher = self.teacher_estimator if self.teacher_estimator is not None else self.estimator
+        with torch.no_grad():
+            v_cond = teacher(y, mu, t, cond, time_step=torch.zeros_like(t))
+            v_uncond = teacher(y, torch.zeros_like(mu), t, cond, time_step=torch.zeros_like(t))
+            s_star = self._compute_zero_star_scale(v_cond, v_uncond)
+            if clamp_s_star is not None:
+                s_star = s_star.clamp(clamp_s_star[0], clamp_s_star[1])
+            # CFG-Zero* 组合：v = s*v_u + w*(v_c - s*v_u)
+            v_teacher = v_uncond * s_star + w * (v_cond - v_uncond * s_star)
+
+        # ---- 学生：带 w 嵌入的单次前向 ----
+        w_t = torch.full((b,), float(w), device=x1.device, dtype=x1.dtype)
+        v_student = self.estimator(y, mu, t, cond, time_step=torch.zeros_like(t), w=w_t)
+
+        losses = F.mse_loss(v_student, v_teacher.detach(), reduction="none").mean(dim=1)  # 逐样本 MSE -> (B, T)
+        if tgt_mask is not None:
+            weights = self.adaptive_loss_weighting(losses, tgt_mask.squeeze(1))
+            loss = (weights * losses).sum() / torch.clamp(torch.sum(tgt_mask), min=1.0)  # 仅对有效帧加权求平均
+        else:
+            loss = losses.mean()
+        return loss
+
+    # ------------------------------------------------------------------ #
+    # Distilled inference（蒸馏推理：每步单前向，CFG 已烘焙）
+    # ------------------------------------------------------------------ #
+    @torch.inference_mode()
+    def distill_solver(
+        self,
+        mu: torch.Tensor,
+        n_timesteps: int,
+        patch_size: int,
+        cond: torch.Tensor,
+        temperature: float = 1.0,
+        sway_sampling_coef: float = 1.0,
+        w: float = 2.0,
+        use_dt_embed: bool = True,
+    ):
+        """蒸馏模型的 Euler 求解：每步仅一次估计器前向（w 嵌入承载 CFG）。
+
+        时间网格与 ``solve_euler`` 完全一致（含 sway sampling）。
+
+        参数:
+            mu: 全局条件向量，形状 (B, C)
+            n_timesteps: ODE 积分步数
+            patch_size: 待生成分段的帧数 T
+            cond: 前缀条件，形状 (B, C, T')
+            temperature: 初始噪声温度
+            sway_sampling_coef: sway sampling 系数
+            w: CFG 引导强度（须等于训练时的 w，w 嵌入按它条件化）
+            use_dt_embed: 是否向 dt 嵌入传每步步宽。CFG 蒸馏（阶段 1）学生
+                恒以 dt=0 训练，必须传 False
+
+        返回:
+            ODE 轨迹的最终状态，形状 (B, C, T)
+        """
+        b, _ = mu.shape
+        t_len = patch_size
+        x = torch.randn((b, self.in_channels, t_len), device=mu.device, dtype=mu.dtype) * temperature  # 初始噪声
+
+        # 时间网格 1 -> 0（含 sway sampling 重参数化），与 solve_euler 一致
+        t_span = torch.linspace(1, 0, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
+        half_pi_t = torch.pi / 2 * t_span
+        sway_offset = torch.cos(half_pi_t) - 1 + t_span
+        t_span = t_span + sway_sampling_coef * sway_offset
+        w_t = torch.full((b,), float(w), device=mu.device, dtype=mu.dtype)
+
+        for step in range(1, len(t_span)):
+            t = t_span[step - 1]
+            dt = t_span[step - 1] - t_span[step]
+            t_in = torch.full((b,), float(t), device=mu.device, dtype=mu.dtype)
+            if use_dt_embed:
+                d_in = torch.full((b,), float(dt), device=mu.device, dtype=mu.dtype)
+            else:
+                d_in = torch.zeros_like(t_in)
+            v = self.estimator(x, mu, t_in, cond, time_step=d_in, w=w_t)  # 单前向，CFG 已烘焙进 w 嵌入
+            x = x - dt * v  # Euler 单步更新
+        return x
 
     # ------------------------------------------------------------------ #
     # Training loss

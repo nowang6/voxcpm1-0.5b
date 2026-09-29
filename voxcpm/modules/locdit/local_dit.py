@@ -112,9 +112,25 @@ class VoxCPMLocDiT(nn.Module):
             in_channels=config.hidden_size,
             time_embed_dim=config.hidden_size,
         )  # ODE 步长（delta t）的 MLP 嵌入
+        # CFG 蒸馏：引导强度 w 的嵌入，使单次前向即可复现 cond/uncond 双分支的 CFG 组合速度场
+        self.cfg_mlp = TimestepEmbedding(
+            in_channels=config.hidden_size,
+            time_embed_dim=config.hidden_size,
+        )
 
         assert config.vocab_size == 0, "vocab_size must be 0 for local DiT"
         self.decoder = MiniCPMModel(config)  # 复用 MiniCPM4 Transformer 作为 DiT 主干
+
+    def init_cfg_embedding_zero(self):
+        """零初始化 cfg 嵌入 MLP。
+
+        保证蒸馏学生从「教师条件分支」的行为起步（w 嵌入初始输出为 0，
+        不改变原模型的前向结果）。
+        """
+        nn.init.zeros_(self.cfg_mlp.linear_1.weight)
+        nn.init.zeros_(self.cfg_mlp.linear_1.bias)
+        nn.init.zeros_(self.cfg_mlp.linear_2.weight)
+        nn.init.zeros_(self.cfg_mlp.linear_2.bias)
 
     def forward(
         self,
@@ -123,6 +139,7 @@ class VoxCPMLocDiT(nn.Module):
         current_time: torch.Tensor,
         cond: torch.Tensor,
         time_step: torch.Tensor,
+        w: torch.Tensor | None = None,
     ):
         """DiT 前向：预测流匹配速度场 v(x_t, t | 条件)。
 
@@ -132,6 +149,8 @@ class VoxCPMLocDiT(nn.Module):
             current_time: 当前扩散时间步，形状 (N,)
             cond: 前缀（上文）条件张量，形状 (N, C, T')
             time_step: ODE 步长 (t - r)，形状 (N,)，用于平均速度模式（未来可能启用）
+            w: 可选的 CFG 引导强度，形状 (N,)。蒸馏学生传入后将 w 嵌入叠加到
+                时间条件上，用单次前向复现 CFG 组合速度场；None 即普通前向
         """
         state = self.in_proj(state.transpose(1, 2).contiguous())  # (N, C, T) -> (N, T, C) 后投影到隐层维度 -> (N, T, hidden_size)
 
@@ -143,6 +162,10 @@ class VoxCPMLocDiT(nn.Module):
         time_step = self.time_embeddings(time_step).to(state.dtype)  # 步长正弦编码 -> (N, hidden_size)
         time_step = self.delta_time_mlp(time_step)  # 步长 MLP 嵌入
         current_time = current_time + time_step  # 条件注入：将当前时刻与步长的嵌入相加，得到时间条件向量
+        if w is not None:
+            w = self.time_embeddings(w).to(state.dtype)  # 引导强度 w 的正弦编码 -> (N, hidden_size)
+            w = self.cfg_mlp(w)  # w 的 MLP 嵌入
+            current_time = current_time + w  # 与时间条件同路注入首 token（蒸馏单前向 CFG 的关键通路）
 
         state = torch.cat([(mu + current_time).unsqueeze(1), cond, state], dim=1)  # 拼接序列 [全局条件 token(1) | 前缀条件(T') | 当前状态(T)]，全局条件通过 mu+时间嵌入相加注入首 token
         hidden, _ = self.decoder(state, is_causal=False)  # 非因果 Transformer 编码（当前状态可关注全部条件前缀）
