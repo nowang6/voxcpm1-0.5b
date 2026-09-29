@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 工具缓存
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+
+# 系统文件
+.DS_Store
+
+# 训练产物 (checkpoint / TensorBoard / 日志)
+checkpoints/
+runs/
+*.log
+
+# 模型权重 (防止误提交大文件)
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# 训练数据与音频输出
+data/
+*.wav
+*.flac
+*.mp3
+!assets/*.wav

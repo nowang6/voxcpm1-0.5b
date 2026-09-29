@@ -1,0 +1,40 @@
+# VoxCPM1-0.5B 全参数微调配置示例
+# 运行: python train.py --config conf/finetune_example.yaml
+# CLI 参数会覆盖这里的同名配置, 例如: python train.py --config conf/finetune_example.yaml --num_iters 100
+
+pretrained_path: /data/models/VoxCPM-0.5B
+train_manifest: data/train.jsonl     # jsonl, 每行 {"text": "...", "audio": "/abs/path.wav"}
+val_manifest: ""                     # 留空则不验证
+
+sample_rate: 16000                   # 必须等于 AudioVAE 编码器采样率 (16000)
+
+batch_size: 4
+grad_accum_steps: 1                  # >1 可在不增加显存的情况下放大有效 batch
+num_workers: 2
+max_batch_tokens: 8192               # 估算样本 token 数超过 max_batch_tokens/batch_size 的样本会被丢弃, 防止 OOM
+
+num_iters: 2000
+learning_rate: 0.00001
+weight_decay: 0.01
+warmup_steps: 100
+max_grad_norm: 1.0                   # 梯度裁剪, 0 为关闭
+
+lambda_diff: 1.0                     # loss/diff 权重
+lambda_stop: 1.0                     # loss/stop 权重
+
+# 额外冻结的模块 (按参数名前缀). audio_vae 始终冻结.
+# 留空 = 除 audio_vae 外全部参数参与训练 (全参数微调).
+# 例如只训练声学侧, 保留 WER 不动:
+#   freeze_prefixes: ["base_lm.", "fsq_layer.", "stop_proj.", "stop_actn.", "stop_head.", "enc_to_lm_proj.", "lm_to_dit_proj."]
+freeze_prefixes: []
+
+log_interval: 10
+valid_interval: 500
+save_interval: 500
+num_val_batches: 10                  # 每次验证最多跑多少个 batch
+num_audio_samples: 2                 # 验证时往 TensorBoard 写多少条试听音频 (0 关闭)
+
+save_path: checkpoints/finetune_all
+tensorboard: checkpoints/finetune_all/logs
+
+seed: 42
