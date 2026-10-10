@@ -220,7 +220,7 @@ def save_latest(student, opt, sched, step, path: Path):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--pretrained_path", default="/data/models/VoxCPM-0.5B")
-    p.add_argument("--lmdb_dir", default="/data/datasets/tts_1000h/dit_conditions/train_v2")
+    p.add_argument("--lmdb_dir", default="/data/datasets/cfg-distill/train_v2")
     p.add_argument("--w", type=float, default=2.0, help="蒸馏目标使用的 CFG 引导强度（=推理时 cfg_value）")
     p.add_argument("--init_dit", default="", help="可选的 DiT checkpoint（如上一轮蒸馏产物），默认取预训练权重")
     p.add_argument("--batch_size", type=int, default=256)
@@ -257,10 +257,22 @@ def main():
 
     student = build_student_dit(args.pretrained_path, device, dtype).to(device, dtype)
     student.estimator.init_cfg_embedding_zero()  # 学生初始行为 = 教师条件分支
-    base_sd = args.init_dit or os.path.join(args.pretrained_path, "model.safetensors")
+    # 教师永远取原始 base 权重的冻结副本：蒸馏目标唯一且静止。--init_dit 只热启动
+    # 学生——若让它同时改变教师，已收敛学生会突然失配新目标（自身权重的组合场
+    # 从未被训练约束），loss 会从 ~0.03 跳到 0.2+。
+    base_sd = os.path.join(args.pretrained_path, "model.safetensors")
     if not os.path.exists(base_sd):
         base_sd = os.path.join(args.pretrained_path, "pytorch_model.bin")
     load_dit_weights(student, base_sd, device)
+    import copy
+
+    teacher = copy.deepcopy(student.estimator)
+    for pm in teacher.parameters():
+        pm.requires_grad_(False)
+    teacher.eval()
+    student.teacher_estimator = teacher
+    if args.init_dit:  # 学生从蒸馏产物热启动（教师保持 base 不变）
+        load_dit_weights(student, args.init_dit, device)
     student.train()
 
     # ---- 数据：v2 块打包（__meta__.json 存在性校验） ----
@@ -281,10 +293,9 @@ def main():
         sampler=sampler,
     )
 
-    # ---- 优化器：分层 LR + （默认）冻结教师副本 ----
+    # ---- 优化器：分层 LR（教师副本已在加载段挂好，恒为 base 权重） ----
     # 主干从教师初始化、只需小步微调；零初始化的 cfg 嵌入需要快得多 的学习率。
-    # 默认（非 --train_cfg_only）：deepcopy 一份学生作为冻结教师副本挂到
-    # teacher_estimator——回归目标静止，学生全网络可训练（两个历史问题一次
+    # 冻结教师副本 + 学生全网络：回归目标静止，学生全容量（两个历史问题一次
     # 解决：共享权重的自蒸馏目标随更新移动会发散；cfg-only 又欠拟合）。
     cfg_params = [pm for nm, pm in student.named_parameters() if "cfg_mlp" in nm]
     base_params = [pm for nm, pm in student.named_parameters() if "cfg_mlp" not in nm]
@@ -296,13 +307,6 @@ def main():
                                 weight_decay=args.weight_decay)
         trainables = cfg_params
     else:
-        import copy
-
-        teacher = copy.deepcopy(student.estimator)
-        for pm in teacher.parameters():
-            pm.requires_grad_(False)
-        teacher.eval()
-        student.teacher_estimator = teacher
         opt = torch.optim.AdamW(
             [
                 {"params": base_params, "lr": args.learning_rate},
@@ -338,11 +342,13 @@ def main():
         ckpt = torch.load(latest_path, map_location="cpu", weights_only=True)
         student.estimator.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
-        sched.load_state_dict(ckpt["sched"])
         step = ckpt["step"]
-        for _ in range(step):  # LambdaLR 无法直接快进，逐步推进
+        # 调度器不 load 旧 state_dict：先 load 再快进会把 last_epoch 翻倍
+        # （99800*2/200000 -> cosine 末尾 lr≈0，训练空转）。改为按当前
+        # --num_iters 的新周期从头重放到 step，lr 即为新配置该步的正确值。
+        for _ in range(step):
             sched.step()
-        log(f"resumed from {latest_path} at step={step}")
+        log(f"resumed from {latest_path} at step={step} (lr={sched.get_last_lr()[0]:.2e})")
 
     autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=(args.dtype == "bfloat16"))
     init_loss = None  # 本进程首个迭代的 loss（断点续训后重新赋值，发散保护基准）
