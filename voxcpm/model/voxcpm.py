@@ -143,6 +143,40 @@ class VoxCPMModel(VoxCPMGenerationMixin, nn.Module):
         self.chunk_size = audio_vae.chunk_size  # VAE 每次解码的 chunk 大小（patch 数）
         self.sample_rate = audio_vae.sample_rate  # VAE 采样率（16000 Hz）
 
+        # P-Tuning 说话人前缀（soft prompt）：模型参数冻结时，仅这组前缀向量参与训练。
+        # 前缀作为虚拟 token 注入 base_lm 与 residual_lm 的输入序列最前端，
+        # 将固定说话人的音色/韵律信息直接编码进模型权重。
+        pcfg = self.config.prefix_tune
+        self.base_prefix = nn.Parameter(torch.randn(pcfg.num_virtual_tokens, config.lm_config.hidden_size) * 0.02)
+        self.residual_prefix = nn.Parameter(torch.randn(pcfg.num_virtual_tokens, config.lm_config.hidden_size) * 0.02)
+        # 推理时通过 config.prefix_tune.enabled 控制是否注入；训练脚本会按需开启
+        if pcfg.enabled:
+            print(f"[prefix_tune] enabled, num_virtual_tokens={pcfg.num_virtual_tokens}", file=sys.stderr)
+
+    def _prefix_embed(self):
+        """返回启用状态下的说话人前缀嵌入 (K, H)。
+
+        未启用时返回空张量（调用方据此跳过注入），与旧行为完全一致。
+        """
+        if not self.config.prefix_tune.enabled:
+            return None
+        return self.base_prefix.to(device=self.device, dtype=self._dtype())
+
+    def _cat_prefix(self, embed: torch.Tensor, prefix: torch.Tensor | None):
+        """把说话人前缀拼接到嵌入序列最前端。
+
+        Args:
+            embed: (B, T, H) 原始输入嵌入。
+            prefix: (K, H) 或 None（未启用）。
+
+        Returns:
+            (B, T+K, H)；prefix 为 None 时原样返回。
+        """
+        if prefix is None:
+            return embed
+        B = embed.shape[0]
+        return torch.cat([prefix.unsqueeze(0).expand(B, -1, -1), embed], dim=1)
+
     def optimize(self, disable: bool = False):
         """使用 torch.compile 编译热点子模块以加速推理。
 
@@ -215,12 +249,14 @@ class VoxCPMModel(VoxCPMGenerationMixin, nn.Module):
         """
         del position_ids  # not used yet
 
-        # 统一把各输入搬到目标设备与精度
+        # 统一把各输入搬到目标设备与精度。
+        # 注意：模型权重保持 float32（配合 AMP autocast 使用），输入统一为 float32，
+        # 由 autocast 在 matmul 处自动转 bf16；直接 cast 输入为 bf16 反而会导致精度损失。
         text_tokens = text_tokens.to(self.device, dtype=torch.long)
-        text_mask = text_mask.to(self.device, dtype=self._dtype())
-        audio_feats = audio_feats.to(self.device, dtype=self._dtype())
-        audio_mask = audio_mask.to(self.device, dtype=self._dtype())
-        loss_mask = loss_mask.to(self.device, dtype=self._dtype())
+        text_mask = text_mask.to(self.device, dtype=torch.float32)
+        audio_feats = audio_feats.to(self.device, dtype=torch.float32)
+        audio_mask = audio_mask.to(self.device, dtype=torch.float32)
+        loss_mask = loss_mask.to(self.device, dtype=torch.float32)
         labels = labels.to(self.device, dtype=torch.long)
 
         B, T, P, D = audio_feats.shape  # (batch, 序列长度, patch 大小, 特征维度)
@@ -235,6 +271,17 @@ class VoxCPMModel(VoxCPMGenerationMixin, nn.Module):
         # 按 mask 融合两种嵌入：文本位置取文本嵌入、音频位置取音频嵌入
         combined_embed = text_mask.unsqueeze(-1) * text_embed + audio_mask.unsqueeze(-1) * feat_embed
 
+        # 说话人前缀（P-Tuning）：开启时作为虚拟 token 拼到序列最前端，
+        # 前缀位置不计任何损失（loss_mask=0），仅提供音色/韵律条件
+        prefix = self._prefix_embed()
+        loss_mask_seq = loss_mask  # 保留原始 T 维的 loss_mask，用于下游展开 loss_seq_mask（与 feat_gt 的 T 对齐）
+        if prefix is not None:
+            K = prefix.shape[0]
+            zpad = lambda m: torch.cat((torch.zeros_like(m[:, 0:1]).expand(-1, K), m), dim=1)  # noqa: E731
+            combined_embed = self._cat_prefix(combined_embed, prefix)
+            text_mask, audio_mask = zpad(text_mask), zpad(audio_mask)
+            # labels / loss_mask 保持原始 T 维（不 pad），下游停止损失与裁剪后的 lm_hidden（原始 T 维）对齐
+
         # 基础 LM 因果前向（teacher forcing，一次看完整序列）
         enc_outputs, _ = self.base_lm(inputs_embeds=combined_embed, is_causal=True)
         enc_outputs = enc_outputs.to(self._dtype())
@@ -244,7 +291,21 @@ class VoxCPMModel(VoxCPMGenerationMixin, nn.Module):
         lm_hidden = torch.cat((torch.zeros_like(enc_outputs[:, 0:1, :]), enc_outputs[:, :-1, :]), dim=1)
 
         # 残差声学 LM：输入为量化后的隐状态（文本位置）加上原始音频嵌入（音频位置）
-        residual_inputs = enc_outputs + audio_mask.unsqueeze(-1) * feat_embed
+        # feat_embed 需与 base_lm 输出对齐（T+K 维）：前缀位置补零，仅音频段携带真实嵌入；
+        # residual_inputs 本身已包含前缀（T+K 维），直接前向即可，无需重复拼接
+        if prefix is not None:
+            feat_embed_padded = torch.cat(
+                (torch.zeros_like(prefix).unsqueeze(0).expand(feat_embed.shape[0], -1, -1), feat_embed), dim=1
+            )
+            # 残差 LM 使用独立的前缀参数（residual_prefix），与 base_lm 的前缀解耦，
+            # 各自学习适合自身输入分布的说话人表示
+            residual_inputs = enc_outputs + audio_mask.unsqueeze(-1) * feat_embed_padded
+            residual_inputs = self._cat_prefix(
+                residual_inputs, self.residual_prefix.to(device=self.device, dtype=self._dtype())
+            )
+        else:
+            feat_embed_padded = feat_embed
+            residual_inputs = enc_outputs + audio_mask.unsqueeze(-1) * feat_embed_padded
         residual_outputs, _ = self.residual_lm(inputs_embeds=residual_inputs, is_causal=True)
         residual_outputs = residual_outputs.to(self._dtype())
         # 同样右移一位，保持因果性
@@ -253,25 +314,31 @@ class VoxCPMModel(VoxCPMGenerationMixin, nn.Module):
             dim=1,
         )
 
-        # 双路条件相加后投影到 DiT 维度，作为流匹配的速度场估计条件
+        # 双路条件相加后投影到 DiT 维度，作为流匹配的速度场估计条件。
+        # residual LM 额外注入了 residual_prefix，其输出比 base_lm 多 K 个前缀位置；
+        # 各自先裁剪/对齐到原始 T 长度（流匹配目标 feat_gt/feat_cond 定义在原始 T 个位置上），
+        # 前缀位置仅参与 LM 上下文，不对应任何待预测的音频 patch
+        T_orig = audio_feats.shape[1]
+        if prefix is not None:
+            lm_hidden = lm_hidden[:, -T_orig:, :]
+            residual_hidden = residual_hidden[:, -T_orig:, :]
         dit_hidden = self.lm_to_dit_proj(lm_hidden) + self.res_to_dit_proj(residual_hidden)
         dit_hidden = rearrange(dit_hidden, "b t c -> (b t) c")  # (B*T, dit_hidden)，逐 patch 独立求解
 
         # Keep diffusion inputs in the same dtype as the model (e.g., bfloat16)
         # 扩散输入与模型保持同一精度（如 bfloat16）
-        target_dtype = self._dtype()
-
-        feat_gt = rearrange(audio_feats.to(target_dtype), "b t p d -> (b t) p d")  # 目标特征 (B*T, P, D)
+        feat_gt = rearrange(audio_feats, "b t p d -> (b t) p d")  # 目标特征 (B*T, P, D)，输入统一 float32 由 autocast 接管
         # 条件特征 = 上一个 patch（右移一位）：首个位置用零填充，保证以已生成的历史为条件
         feat_cond = torch.cat(
             (torch.zeros_like(audio_feats[:, 0:1, ...]), audio_feats[:, :-1, ...]),
             dim=1,
         )
-        feat_cond = rearrange(feat_cond.to(target_dtype), "b t p d -> (b t) p d")
+        feat_cond = rearrange(feat_cond, "b t p d -> (b t) p d")  # audio_feats 已在开头统一为 float32
 
         # 把 patch 级 loss_mask 展开到 patch 内每一帧，并变形为 (B*T, P, 1)
-        loss_seq_mask = loss_mask.unsqueeze(-1).repeat(1, 1, self.patch_size)
-        loss_seq_mask = rearrange(loss_seq_mask, "b t p -> (b t) p 1").to(target_dtype)
+        # 使用原始 T 维的 loss_mask（loss_mask_seq），保证与 feat_gt/feat_cond 的序列长度一致
+        loss_seq_mask = loss_mask_seq.unsqueeze(-1).repeat(1, 1, self.patch_size)
+        loss_seq_mask = rearrange(loss_seq_mask, "b t p -> (b t) p 1")
 
         # 流匹配（CFM）条件流匹配损失：预测速度场 v(x_t, t | cond)
         diff_loss = self.feat_decoder.compute_loss(
@@ -282,7 +349,8 @@ class VoxCPMModel(VoxCPMGenerationMixin, nn.Module):
             progress=progress,
         )
 
-        # 停止预测头：由右移后的 LM 隐状态预测每个位置的停止概率
+        # 停止预测头：由右移后的 LM 隐状态预测每个位置的停止概率。
+        # lm_hidden / labels / loss_mask 均已对齐到原始 T 维（前缀位置已在双路条件投影前裁剪）
         stop_logits = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden)))  # (B, T, 2)
         stop_losses = self.stop_loss(stop_logits.transpose(1, 2), labels)  # 逐位置交叉熵 (B, T)
         # 仅对有效位置（loss_mask=1）求平均，min=1 防止除零

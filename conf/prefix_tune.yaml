@@ -1,0 +1,39 @@
+# VoxCPM1-0.5B P-Tuning 说话人前缀训练配置（单一说话人，tts-clean 数据集）
+# 用法: python train.py --config conf/prefix_tune.yaml
+# 模型权重全部冻结，仅训练 base_prefix / residual_prefix 两组说话人前缀向量
+
+pretrained_path: /data/models/VoxCPM-0.5B
+train_manifest: data/train_ptune.jsonl
+val_manifest: data/val_ptune.jsonl
+
+prefix_tune: true                   # 启用 P-Tuning（冻结全部模型权重，只训说话人前缀）
+num_virtual_tokens: 32              # 前缀虚拟 token 数
+prefix_lr: 0.001                    # 前缀学习率（远高于全参微调的 1e-5）
+
+sample_rate: 16000
+batch_size: 4
+grad_accum_steps: 1
+num_workers: 2
+max_batch_tokens: 8192
+
+num_iters: 3000
+learning_rate: 0.00001              # 全参学习率（P-Tuning 模式下不使用，仅占位）
+weight_decay: 0.0                   # 前缀训练无权重衰减
+warmup_steps: 100
+max_grad_norm: 1.0
+
+lambda_diff: 1.0
+lambda_stop: 1.0
+
+freeze_prefixes: []                 # P-Tuning 模式下自动冻结全部模型参数，无需额外指定
+
+log_interval: 10
+valid_interval: 500
+save_interval: 500
+num_val_batches: 10
+num_audio_samples: 2                # 验证时生成样本音频（注意：是零样本生成，直接观察模型音色收敛）
+
+save_path: checkpoints/prefix_tune_tts_clean
+tensorboard: checkpoints/prefix_tune_tts_clean/logs
+
+seed: 42

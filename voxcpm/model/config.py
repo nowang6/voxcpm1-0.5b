@@ -36,6 +36,17 @@ class VoxCPMDitConfig(BaseModel):
     cfm_config: CfmConfig  # 流匹配（CFM）相关超参配置
 
 
+class PrefixTuneConfig(BaseModel):
+    """P-Tuning 说话人前缀（soft prompt）配置。
+
+    模型参数全部冻结，仅学习一组可学习的前缀向量来编码固定说话人，
+    注入到 base_lm 与 residual_lm 的输入序列最前端（P-Tuning 风格）。
+    """
+
+    num_virtual_tokens: int = 32  # 前缀虚拟 token 数（容量约等效 2.5 秒参考音频）
+    enabled: bool = False  # 是否注入前缀（推理/训练开关）
+
+
 class VoxCPMConfig(BaseModel):
     """VoxCPM 模型整体配置：包含文本-语义 LM、残差声学 LM、局部编码器/解码器等子模块配置。"""
 
@@ -54,6 +65,7 @@ class VoxCPMConfig(BaseModel):
     device: str = "cuda"  # 默认运行设备
     dtype: str = "bfloat16"  # 默认计算精度
     dit_mean_mode: bool = False  # 流匹配解码器均值的计算模式
+    prefix_tune: PrefixTuneConfig = PrefixTuneConfig()  # P-Tuning 前缀配置（默认关闭，保持与旧行为一致）
 
 
 VoxCPMConfig.model_rebuild()

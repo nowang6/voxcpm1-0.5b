@@ -33,6 +33,7 @@ class VoxCPMGenerationMixin:
     - 子模块：base_lm、residual_lm、feat_encoder、feat_decoder、audio_vae、
       fsq_layer、enc_to_lm_proj、lm_to_dit_proj、res_to_dit_proj、
       stop_proj、stop_actn、stop_head
+    - P-Tuning：base_prefix、residual_prefix（见 voxcpm.py 中的定义与注入逻辑）
     """
 
     # ------------------------------------------------------------------
@@ -457,9 +458,46 @@ class VoxCPMGenerationMixin:
         # 按 mask 融合：文本位置取词嵌入，音频位置取音频特征嵌入
         combined_embed = text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed
 
+        # 说话人前缀（P-Tuning）：开启时作为虚拟 token 拼到 prefill 序列最前端。
+        # 注意 prefixes 会被注意力看见并写入 KV 缓存，后续逐 patch 解码自然以其为条件；
+        # 注意 base_lm 的前缀输出同样会经 FSQ 量化层进入残差 LM 与逐帧解码路径。
+        prefix = self._prefix_embed()
+        if prefix is not None:
+            combined_embed = self._cat_prefix(combined_embed, prefix)
+            text_mask = torch.cat(
+                (torch.ones(prefix.shape[0], dtype=text_mask.dtype, device=text_mask.device).unsqueeze(0), text_mask),
+                dim=1,
+            )
+            feat_mask = torch.cat(
+                (torch.zeros(prefix.shape[0], dtype=feat_mask.dtype, device=feat_mask.device).unsqueeze(0), feat_mask),
+                dim=1,
+            )
+
         prefix_feat_cond = feat[:, -1, ...]  # b, p, d：首个 patch 的流匹配条件（序列最后一个已知 patch）
         pred_feat_seq = []  # b, t, p, d：已生成 patch 的列表
         curr_embed = None
+
+        # 残差 LM 前缀（与训练前向一致）：开启时作为虚拟 token 拼到残差 LM 输入最前端
+        residual_prefix_embed = (
+            self.residual_prefix.to(device=self.device, dtype=get_dtype(self.config.dtype))
+            if self.config.prefix_tune.enabled
+            else None
+        )
+        # feat_embed 需与 enc_outputs（T+K）对齐：前缀位置补零，仅音频段携带真实嵌入
+        if residual_prefix_embed is not None:
+            feat_embed_padded = torch.cat(
+                (
+                    torch.zeros(
+                        (feat_embed.shape[0], residual_prefix_embed.shape[0], feat_embed.shape[-1]),
+                        dtype=feat_embed.dtype,
+                        device=feat_embed.device,
+                    ),
+                    feat_embed,
+                ),
+                dim=1,
+            )
+        else:
+            feat_embed_padded = feat_embed
 
         # Prepare prompt context patches for streaming mode
         # When there's a prompt audio, use its last (streaming_prefix_len - 1) patches as initial context
@@ -488,8 +526,13 @@ class VoxCPMGenerationMixin:
         lm_hidden = enc_outputs[:, -1, :]  # 取最后一个位置的隐状态作为首个生成步的条件
 
         # ---------- prefill：残差声学 LM 同样填充 KV 缓存 ----------
+        # 残差 LM 的输入与训练前向一致：量化隐状态 + 音频位置嵌入（feat_embed），
+        # 并在最前端拼接独立的前缀参数（residual_prefix）
+        residual_inputs = enc_outputs + feat_mask.unsqueeze(-1) * feat_embed_padded
+        if residual_prefix_embed is not None:
+            residual_inputs = self._cat_prefix(residual_inputs, residual_prefix_embed)
         residual_enc_outputs, residual_kv_cache_tuple = self.residual_lm(
-            inputs_embeds=enc_outputs + feat_mask.unsqueeze(-1) * feat_embed,
+            inputs_embeds=residual_inputs,
             is_causal=True,
         )
         self.residual_lm.kv_cache.fill_caches(residual_kv_cache_tuple)

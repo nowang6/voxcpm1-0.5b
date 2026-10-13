@@ -73,6 +73,13 @@ def parse_args():
     parser.add_argument("--freeze_prefixes", type=str, nargs="*", default=None,
                         help="Param-name prefixes to freeze (audio_vae is always frozen). "
                              "e.g. --freeze_prefixes base_lm. fsq_layer. to train only the acoustic side")
+    # P-Tuning 说话人前缀训练：模型全部冻结，仅学习 base_prefix/residual_prefix 两个参数
+    parser.add_argument("--prefix_tune", action="store_true", default=None,
+                        help="P-Tuning mode: freeze all model weights, train only speaker prefix tokens")
+    parser.add_argument("--prefix_lr", type=float, default=None,
+                        help="Learning rate for prefix tokens in --prefix_tune mode (default 1e-3)")
+    parser.add_argument("--num_virtual_tokens", type=int, default=None,
+                        help="Number of virtual prefix tokens (default 32)")
     # logging / saving
     parser.add_argument("--log_interval", type=int, default=None)  # 每隔多少步打印一次训练日志
     parser.add_argument("--valid_interval", type=int, default=None)  # 每隔多少步做一次验证
@@ -114,6 +121,9 @@ def load_config(args) -> dict:
         "lambda_diff": 1.0,
         "lambda_stop": 1.0,
         "freeze_prefixes": [],
+        "prefix_tune": False,        # P-Tuning：仅训练说话人前缀
+        "prefix_lr": 1e-3,           # 前缀向量学习率（远高于全参微调的 1e-5）
+        "num_virtual_tokens": 32,    # 前缀虚拟 token 数
         "log_interval": 10,
         "valid_interval": 500,
         "save_interval": 1000,
@@ -144,6 +154,9 @@ def load_config(args) -> dict:
     if not cfg["pretrained_path"] or not cfg["train_manifest"]:
         raise ValueError("pretrained_path and train_manifest are required (CLI or YAML config)")
 
+    # P-Tuning：启用说话人前缀（训练/推理路径都会注入；--num_virtual_tokens 同步到配置）
+    if cfg["prefix_tune"]:
+        cfg.setdefault("num_virtual_tokens", 32)
     # lambdas used by the training loop
     # 供训练循环使用的各项损失权重（流匹配损失 + 停止预测损失）
     cfg["lambdas"] = {"loss/diff": cfg["lambda_diff"], "loss/stop": cfg["lambda_stop"]}
@@ -410,11 +423,31 @@ def train(cfg: dict):
     base_model = VoxCPMModel.from_local(cfg["pretrained_path"], optimize=False, training=True)
     tokenizer = base_model.text_tokenizer
 
+    # P-Tuning 模式：开启说话人前缀注入，冻结除前缀外全部参数（仅学习说话人前缀）
+    if cfg["prefix_tune"]:
+        base_model.config.prefix_tune.enabled = True
+        base_model.config.prefix_tune.num_virtual_tokens = cfg["num_virtual_tokens"]
+        # prefix 参数转为 float32：确保 AMP GradScaler 的梯度检查/反缩放能正常工作，
+        # 同时提高小参数量下的训练数值稳定性（模型主体保持 AMP bf16 autocast 不变）
+        base_model.base_prefix.data = base_model.base_prefix.data.float()
+        base_model.residual_prefix.data = base_model.residual_prefix.data.float()
+        if is_main:
+            print(
+                f"[prefix_tune] enabled, num_virtual_tokens={cfg['num_virtual_tokens']}, "
+                f"prefix_lr={cfg['prefix_lr']}, prefix dtype=float32",
+                file=sys.stderr,
+            )
+
     # Full-parameter finetune: audio_vae is already frozen in from_local().
     # Optionally freeze extra modules via freeze_prefixes.
     # 全参数微调：audio_vae 已在 from_local() 中冻结；
     # 可通过 freeze_prefixes 追加冻结其他模块（实现部分参数微调）
     freeze_prefixes = ["audio_vae."] + list(cfg["freeze_prefixes"])
+    # P-Tuning 模式：追加冻结全部模型权重，仅保留前缀参数可训练
+    if cfg["prefix_tune"]:
+        freeze_prefixes.extend(["base_lm.", "residual_lm.", "feat_encoder.", "feat_decoder.", "fsq_layer.",
+                                "enc_to_lm_proj.", "lm_to_dit_proj.", "res_to_dit_proj.",
+                                "stop_proj.", "stop_actn.", "stop_head."])
     n_frozen = n_total = 0
     for name, param in base_model.named_parameters():
         n_total += 1
@@ -517,11 +550,24 @@ def train(cfg: dict):
 
     # ---------------- optimizer ---------------- #
     # 仅优化 requires_grad=True（即未被冻结）的参数
-    optimizer = AdamW(
-        (p for p in model.parameters() if p.requires_grad),
-        lr=cfg["learning_rate"],
-        weight_decay=cfg["weight_decay"],
-    )
+    # P-Tuning 模式：模型参数全部冻结，仅优化说话人前缀，使用独立（更高）的学习率与无权重衰减
+    if cfg["prefix_tune"]:
+        optimizer = AdamW(
+            (p for p in model.parameters() if p.requires_grad),
+            lr=cfg["prefix_lr"],
+            weight_decay=0.0,
+        )
+        if is_main:
+            tracker.print(
+                f"[prefix_tune] optimizer: AdamW(lr={cfg['prefix_lr']}, wd=0.0), "
+                f"trainable tensors: {sum(1 for p in model.parameters() if p.requires_grad)}"
+            )
+    else:
+        optimizer = AdamW(
+            (p for p in model.parameters() if p.requires_grad),
+            lr=cfg["learning_rate"],
+            weight_decay=cfg["weight_decay"],
+        )
     # 余弦退火学习率调度，前置 warmup_steps 步线性预热
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,

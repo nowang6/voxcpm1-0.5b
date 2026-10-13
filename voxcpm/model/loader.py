@@ -88,6 +88,9 @@ def load_from_local(
         for name, param in model.named_parameters():
             if "audio_vae" in name:  # freeze VAE weights
                 param.requires_grad = False
+    # 将随机初始化的 prefix 参数迁移到运行设备/精度（与模型主体一致），确保保存/加载口径统一
+    model.base_prefix.data = model.base_prefix.data.to(device=model.device, dtype=get_dtype(model.config.dtype))
+    model.residual_prefix.data = model.residual_prefix.data.to(device=model.device, dtype=get_dtype(model.config.dtype))
     model.audio_vae = model.audio_vae.to(torch.float32)  # VAE 编解码保持 float32 以保证数值稳定
 
     # 主模型权重同样优先 safetensors，其次回退到 pytorch_model.bin
@@ -103,8 +106,10 @@ def load_from_local(
 
     # cfg_mlp 是 CFG 蒸馏新增模块：旧权重（预训练/非蒸馏产物）缺失其 4 个键是合法的，
     # 零初始化补齐后行为与原模型完全一致（w 嵌入输出恒 0）；其余缺失/多余键仍视为加载错误。
+    # P-Tuning 说话人前缀（base_prefix/residual_prefix）同理：作为新增可学习参数，
+    # 在预训练权重中不存在是合法的，加载后使用其自身的初始化值。
     missing, unexpected = model.load_state_dict(model_state_dict, strict=False)
-    allowed_missing = {k for k in missing if "cfg_mlp" in k}
+    allowed_missing = {k for k in missing if "cfg_mlp" in k or "base_prefix" in k or "residual_prefix" in k}
     bad_missing = [k for k in missing if k not in allowed_missing]
     if bad_missing or unexpected:
         raise RuntimeError(f"Error(s) in loading state_dict: missing={bad_missing[:5]} unexpected={list(unexpected)[:5]}")
